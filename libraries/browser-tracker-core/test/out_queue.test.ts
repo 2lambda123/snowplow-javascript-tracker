@@ -28,7 +28,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-import { OutQueueManager, OutQueue } from '../src/tracker/out_queue';
+import { OutQueueManager, OutQueue, EventBatch, RequestFailure } from '../src/tracker/out_queue';
 import { SharedState } from '../src/state';
 
 const readPostQueue = () => {
@@ -36,6 +36,15 @@ const readPostQueue = () => {
     window.localStorage.getItem('snowplowOutQueue_sp_post2') ?? fail('Unable to find local storage queue')
   );
 };
+
+const readGetQueue = () =>
+  JSON.parse(window.localStorage.getItem('snowplowOutQueue_sp_get') ?? fail('Unable to find local storage queue'));
+
+const getQuerystring = (p: object) =>
+  '?' +
+  Object.entries(p)
+    .map(([k, v]) => k + '=' + encodeURIComponent(v))
+    .join('&');
 
 describe('OutQueueManager', () => {
   const maxQueueSize = 2;
@@ -57,9 +66,10 @@ describe('OutQueueManager', () => {
     jest.spyOn(window, 'XMLHttpRequest').mockImplementation(() => xhrMock as XMLHttpRequest);
   });
 
-  const respondMockRequest = (status: number) => {
+  const respondMockRequest = (status: number, statusText: string = '') => {
     (xhrMock as any).status = status;
     (xhrMock as any).response = '';
+    (xhrMock as any).statusText = statusText;
     (xhrMock as any).readyState = 4;
     (xhrMock as any).onreadystatechange();
   };
@@ -90,7 +100,8 @@ describe('OutQueueManager', () => {
         {},
         true,
         [401], // retry status codes - override don't retry ones
-        [401, 505] // don't retry status codes
+        [401, 505], // don't retry status codes
+        undefined
       );
     });
 
@@ -169,11 +180,6 @@ describe('OutQueueManager', () => {
 
   describe('GET requests', () => {
     var getOutQueue: (maxGetBytes: number) => OutQueue;
-    const getQuerystring = (p: object) =>
-      '?' +
-      Object.entries(p)
-        .map(([k, v]) => k + '=' + encodeURIComponent(v))
-        .join('&');
 
     beforeEach(() => {
       getOutQueue = (maxGetBytes) =>
@@ -419,6 +425,161 @@ describe('OutQueueManager', () => {
         expect(retrievedQueue).toHaveLength(0);
         done();
       }, 20);
+    });
+  });
+
+  describe('onRequestSuccess callback', () => {
+    const request = { e: 'pv', eid: '65cb78de-470c-4764-8c10-02bd79477a3a' };
+
+    type createQueueArgs = {
+      method: string;
+      useStm: boolean;
+      onSuccess: (data: EventBatch) => void;
+    };
+    const createQueue = (args: createQueueArgs) =>
+      OutQueueManager(
+        'sp',
+        new SharedState(),
+        true,
+        args.method,
+        '/com.snowplowanalytics.snowplow/tp2',
+        1,
+        40000,
+        0,
+        args.useStm,
+        maxQueueSize,
+        5000,
+        false,
+        {},
+        true,
+        [],
+        [],
+        undefined,
+        true,
+        args.onSuccess
+      );
+
+    describe('POST requests', () => {
+      const method = 'POST';
+      const useStm = true;
+
+      it('should fire the onRequestSuccess callback on a successful request', () => {
+        const callbackStorage: EventBatch[] = [];
+        const onSuccess = (e: EventBatch) => {
+          callbackStorage.push(e);
+        };
+
+        const postQueue = createQueue({ method, useStm, onSuccess });
+        postQueue.enqueueRequest(request, 'http://example.com');
+
+        expect(readPostQueue()).toHaveLength(1);
+
+        respondMockRequest(200);
+
+        expect(readPostQueue()).toHaveLength(0);
+        expect(callbackStorage).toHaveLength(1);
+
+        let dataFromCallback = callbackStorage[0][0] as Record<string, unknown>;
+        expect(dataFromCallback.e).toEqual(request.e);
+        expect(dataFromCallback.eid).toEqual(request.eid);
+
+        // The payload will have had `stm` added to it
+        expect(dataFromCallback.stm).toMatch(/\d{13}/);
+      });
+    });
+
+    describe('GET requests', () => {
+      const method = 'GET';
+      const useStm = true;
+      it('should fire the callback on event complete', () => {
+        let callbackStorage: EventBatch[] = [];
+        const onSuccess = (e: EventBatch) => {
+          callbackStorage.push(e);
+        };
+
+        const getQueue = createQueue({ method, useStm, onSuccess });
+        getQueue.enqueueRequest(request, 'http://example.com');
+
+        expect(readGetQueue()).toHaveLength(1);
+
+        respondMockRequest(200);
+
+        expect(readGetQueue()).toHaveLength(0);
+        expect(callbackStorage).toHaveLength(1);
+
+        // turn the querystring into an object
+        let dataFromCallback = callbackStorage[0][0] as string;
+
+        expect(dataFromCallback).toMatch(/\?stm=\d{13}&e=pv&eid=65cb78de-470c-4764-8c10-02bd79477a3a/);
+      });
+    });
+  });
+
+  describe('onRequestFailure callback', () => {
+    const request = { e: 'pv', eid: '65cb78de-470c-4764-8c10-02bd79477a3a' };
+
+    type createQueueArgs = {
+      method: string;
+      useStm: boolean;
+      onSuccess?: (data: EventBatch) => void;
+      onFailure?: (data: RequestFailure) => void;
+    };
+
+    const createQueue = (args: createQueueArgs) =>
+      OutQueueManager(
+        'sp',
+        new SharedState(),
+        true,
+        args.method,
+        '/com.snowplowanalytics.snowplow/tp2',
+        1,
+        40000,
+        0,
+        args.useStm,
+        maxQueueSize,
+        5000,
+        false,
+        {},
+        true,
+        [],
+        [500],
+        undefined,
+        true,
+        args.onSuccess,
+        args.onFailure
+      );
+
+    describe('POST requests', () => {
+      const method = 'POST';
+      const useStm = true;
+
+      it('should fire the onRequestFailure callback on a failed request', () => {
+        const callbackStorage: RequestFailure[] = [];
+        const onFailure = (e: RequestFailure) => {
+          console.log('onFailure');
+          callbackStorage.push(e);
+        };
+
+        const postQueue = createQueue({ method, useStm, onFailure });
+        postQueue.enqueueRequest(request, 'http://example.com');
+
+        expect(readPostQueue()).toHaveLength(1);
+
+        respondMockRequest(500, 'Internal Server Error');
+
+        expect(readPostQueue()).toHaveLength(0);
+        expect(callbackStorage).toHaveLength(1);
+
+        let dataFromCallback = callbackStorage[0] as RequestFailure;
+
+        const event = dataFromCallback.events[0] as Record<string, unknown>;
+        expect(event.e).toEqual(request.e);
+        expect(event.eid).toEqual(request.eid);
+        expect(event.stm).toMatch(/\d{13}/);
+
+        expect(dataFromCallback.status).toEqual(500);
+        expect(dataFromCallback.message).toEqual('Internal Server Error');
+      });
     });
   });
 });

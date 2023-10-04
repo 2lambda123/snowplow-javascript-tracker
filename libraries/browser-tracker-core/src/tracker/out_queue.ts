@@ -65,8 +65,18 @@ export interface OutQueue {
  * @param dontRetryStatusCodes – Failure HTTP response status codes from Collector for which sending events should not be retried
  * @param idService - Id service full URL. This URL will be added to the queue and will be called using a GET method.
  * @param retryFailedRequests - Whether to retry failed requests
+ * @param onRequestSuccess - Function called when a request succeeds
+ * @param onRequestFailure - Function called when a request does not succeed
  * @returns object OutQueueManager instance
  */
+
+export type EventBatch = (string | Record<string, unknown>)[];
+export type RequestFailure = {
+  events: EventBatch;
+  status?: number;
+  message?: string;
+};
+
 export function OutQueueManager(
   id: string,
   sharedSate: SharedState,
@@ -85,7 +95,9 @@ export function OutQueueManager(
   retryStatusCodes: number[],
   dontRetryStatusCodes: number[],
   idService?: string,
-  retryFailedRequests: boolean = true
+  retryFailedRequests: boolean = true,
+  onRequestSuccess?: (data: EventBatch) => void,
+  onRequestFailure?: (data: RequestFailure) => void
 ): OutQueue {
   type PostEvent = {
     evt: Record<string, unknown>;
@@ -260,7 +272,7 @@ export function OutQueueManager(
     } else {
       const querystring = getQuerystring(request);
       if (maxGetBytes > 0) {
-        const requestUrl = createGetUrl(querystring);
+        const requestUrl = addStmToQueryString(querystring);
         const bytes = getUTF8Length(requestUrl);
         if (bytes >= maxGetBytes) {
           eventTooBigWarning(bytes, maxGetBytes);
@@ -345,13 +357,18 @@ export function OutQueueManager(
         xhr = initializeXMLHttpRequest(url, true, sync);
         numberToSend = chooseHowManyToSend(outQueue);
       } else {
-        url = createGetUrl(outQueue[0]);
+        url = createGetUrl(0);
         xhr = initializeXMLHttpRequest(url, false, sync);
         numberToSend = 1;
       }
 
       const checkRetryFailedRequests = () => {
         if (!retryFailedRequests) {
+          onRequestFailure?.({
+            events: outQueue.slice(0, numberToSend),
+            status: xhr.status,
+            message: xhr.statusText,
+          });
           removeEventsFromQueue(numberToSend);
         }
         executingQueue = false;
@@ -383,7 +400,12 @@ export function OutQueueManager(
       xhr.onreadystatechange = function () {
         if (xhr.readyState === 4) {
           clearTimeout(xhrTimeout);
+          const events = postable(outQueue)
+            ? outQueue.slice(0, numberToSend).map((e) => e.evt)
+            : outQueue.slice(0, numberToSend);
+
           if (xhr.status >= 200 && xhr.status < 300) {
+            onRequestSuccess?.(events);
             onPostSuccess(numberToSend);
             return;
           }
@@ -395,8 +417,14 @@ export function OutQueueManager(
 
           if (!shouldRetryForStatusCode(xhr.status)) {
             LOG.error(`Status ${xhr.status}, will not retry.`);
+            onRequestFailure?.({
+              events,
+              status: xhr.status,
+              message: xhr.statusText,
+            });
             removeEventsFromQueue(numberToSend);
           }
+
           executingQueue = false;
         }
       };
@@ -455,7 +483,7 @@ export function OutQueueManager(
         executingQueue = false;
       };
 
-      image.src = createGetUrl(outQueue[0]);
+      image.src = createGetUrl(0);
 
       setTimeout(function () {
         if (loading && executingQueue) {
@@ -536,16 +564,34 @@ export function OutQueueManager(
   }
 
   /**
-   * Creates the full URL for sending the GET request. Will append `stm` if enabled
-   *
-   * @param nextRequest - the query string of the next request
+   * @returns string - the provided query string with `stm` added
    */
-  function createGetUrl(nextRequest: string) {
+  function addStmToQueryString(queryString: string): string {
+    return queryString.replace('?', '?stm=' + new Date().getTime() + '&');
+  }
+
+  /**
+   * Adds `stm` to the a query string at the provided index of the `outQueue`.
+   * @param outQueueIndex - the index of the first element of the queue
+   */
+  function addStmToQueryStringInOutQueue(outQueueIndex: number): string {
+    outQueue[outQueueIndex] = addStmToQueryString(outQueue[outQueueIndex] as string);
+    return outQueue[outQueueIndex] as string;
+  }
+
+  /**
+   * Returns the full URL for sending the GET request.
+   * Will append `stm` if enabled.
+   *
+   * @param outQueueIndex - the index of the element to create the URL for
+   * @return string - the full URL for sending the GET request
+   */
+  function createGetUrl(outQueueIndex: number) {
     if (useStm) {
-      return configCollectorUrl + nextRequest.replace('?', '?stm=' + new Date().getTime() + '&');
+      return configCollectorUrl + addStmToQueryStringInOutQueue(outQueueIndex);
     }
 
-    return configCollectorUrl + nextRequest;
+    return configCollectorUrl + outQueue[outQueueIndex];
   }
 
   return {
