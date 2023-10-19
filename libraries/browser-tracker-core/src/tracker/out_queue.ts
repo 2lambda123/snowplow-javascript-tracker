@@ -64,6 +64,7 @@ export interface OutQueue {
  * @param retryStatusCodes – Failure HTTP response status codes from Collector for which sending events should be retried (they can override the `dontRetryStatusCodes`)
  * @param dontRetryStatusCodes – Failure HTTP response status codes from Collector for which sending events should not be retried
  * @param idService - Id service full URL. This URL will be added to the queue and will be called using a GET method.
+ * @param retryFailedRequests - Whether to retry failed requests
  * @returns object OutQueueManager instance
  */
 export function OutQueueManager(
@@ -83,7 +84,8 @@ export function OutQueueManager(
   withCredentials: boolean,
   retryStatusCodes: number[],
   dontRetryStatusCodes: number[],
-  idService?: string
+  idService?: string,
+  retryFailedRequests: boolean = true
 ): OutQueue {
   type PostEvent = {
     evt: Record<string, unknown>;
@@ -348,10 +350,18 @@ export function OutQueueManager(
         numberToSend = 1;
       }
 
+      const checkRetryFailedRequests = () => {
+        if (!retryFailedRequests) {
+          removeEventsFromQueue(numberToSend);
+        }
+        executingQueue = false;
+      };
+
       // Time out POST requests after connectionTimeout
       const xhrTimeout = setTimeout(function () {
         xhr.abort();
-        executingQueue = false;
+
+        checkRetryFailedRequests();
       }, connectionTimeout);
 
       const removeEventsFromQueue = (numberToSend: number): void => {
@@ -375,13 +385,19 @@ export function OutQueueManager(
           clearTimeout(xhrTimeout);
           if (xhr.status >= 200 && xhr.status < 300) {
             onPostSuccess(numberToSend);
-          } else {
-            if (!shouldRetryForStatusCode(xhr.status)) {
-              LOG.error(`Status ${xhr.status}, will not retry.`);
-              removeEventsFromQueue(numberToSend);
-            }
-            executingQueue = false;
+            return;
           }
+
+          if (xhr.status === 0) {
+            checkRetryFailedRequests();
+            return;
+          }
+
+          if (!shouldRetryForStatusCode(xhr.status)) {
+            LOG.error(`Status ${xhr.status}, will not retry.`);
+            removeEventsFromQueue(numberToSend);
+          }
+          executingQueue = false;
         }
       };
 
